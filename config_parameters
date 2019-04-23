@@ -1,0 +1,486 @@
+#!/usr/bin/php
+<?php
+
+define("__CONFIG_DIR__", realpath(dirname(__FILE__) . "/../"));
+
+
+ /**
+  * Vault Password
+  *
+  * @author Pierre Cahard <pcahard@gmail.com>
+  */
+class VaultPassword
+{
+    // must not change
+    const
+        DIGEST_METHOD   = "SHA512",
+        CURRENT_VERSION = "0.1";
+
+    protected
+        $vendor        = null,
+        $vaultIV       = null,
+        $vaultPassword = null;
+
+    public function __construct($vendor, $vaultIV)
+    {
+        $this->vendor  = $vendor;
+        $this->vaultIV = $vaultIV;
+    }
+
+    function crypt($text, $encryptKey, $cipher = "AES256")
+    {
+        $digest    = openssl_digest($text, self::DIGEST_METHOD, false);
+        $encrypted = openssl_encrypt(
+            sprintf("%s|%s", $digest, $text),
+            $cipher,
+            $encryptKey,
+            OPENSSL_RAW_DATA,
+            $this->vaultIV
+        );
+        $lines     = array();
+        $encrypted = bin2hex($encrypted);
+
+        do {
+            $lines[]   = substr($encrypted, 0, 80);
+            $encrypted = substr($encrypted, 80);
+        } while (strlen($encrypted)> 80);
+
+        $lines[] = $encrypted;
+        $vault   = sprintf(
+            "!vault |\n" .
+            "%s;%s;%s\n" .
+            "%s",
+            $this->vendor,
+            self::CURRENT_VERSION,
+            $cipher,
+            implode("\n    ", $lines)
+        );
+
+        return $vault;
+    }
+
+
+    function decrypt($vaultData, $decryptKey)
+    {
+        if (!preg_match("/!vault/", $vaultData)) {
+            throw new \Exception("bad format");
+        }
+        $vaultData = str_replace('\n', "\n", $vaultData);
+        $lines     = explode("\n", $vaultData);
+        $lines     = array_map(function($v){return trim($v);}, $lines);
+        $header    = explode(";", $lines[1]);
+
+        if ($header[0] != $this->vendor) {
+            throw new  \Exception("vendor not supported");
+        }
+
+        if ($header[1] != self::CURRENT_VERSION) {
+            throw new \Exception("version not supported");
+        }
+
+        if (empty($header[2])) {
+            throw new \Exception("ciphers is empty");
+        }
+
+        // remove VAULT line
+        array_shift($lines);
+        // remove header line
+        array_shift($lines);
+
+        $encrypted           = hex2bin(implode("", $lines));
+        if (!($decrypted = openssl_decrypt($encrypted, $header[2], $decryptKey, OPENSSL_RAW_DATA, $this->vaultIV))) {
+            printf("\nerror: bad password for vault password: \"%s\".\n", $vaultData);
+            exit -1;
+        }
+
+        list($digest, $text) = explode("|", $decrypted);
+
+        // check the digest
+        if ($digest !== openssl_digest($text, self::DIGEST_METHOD, false)) {
+            throw new \Exception("bad digest");
+        }
+
+        return $text;
+    }
+}
+
+/**
+ * @todo doc
+ */
+class ConfigureApplication
+{
+
+    const
+            APP_CONFIG_DIR      = "./",
+            APP_INI_DIR         = "ini",
+            DATA_DISTS_DIR      = "dists",
+            DEFAULT_SECTION     = "DEFAULT",
+            DEST_DIR            = "configs",
+            DIST_EXT            = ".dist",
+            SECTION_SEPARATOR   = "|";
+
+    protected
+            $iniFile,
+            $iniFiles       = array(),
+            $args           = array(),
+            $tokens         = array(),
+            $windowsHost    = false,
+            $vault          = null,
+            $vaultPassword  = null;
+
+    public function __construct($arguments, $argumentsCount)
+    {
+        $this->args = array_filter($arguments, function($val, $key) {
+            return !preg_match("/-[-]?.*=/i", $val);
+        }, ARRAY_FILTER_USE_BOTH);
+
+        if (1 === $argumentsCount) {
+            $this->help();
+            exit - 1;
+        }
+
+        $this->vault        = new VaultPassword("FOOBAR", ".Q2zz.M#{+\zvR%h");
+        $this->windowsHost  = strtoupper(substr(PHP_OS, 0, 3) === 'WIN');
+        $options            = getopt("c::d::i::p::", array('crypt::', 'decrypt::', "inline::", "password::"));
+        $action             = "config";
+        $actionOptions      = array();
+
+        if ( // check if we have a password as argument
+            (isset($options['password']) && !empty($options['password']) && $password = $options['password'] ) ||
+            (isset($options['p'])        && !empty($options['p'])        && $password = $options['p'])
+        ) {
+            $this->vaultPassword = $password;
+            var_dump($password);
+        }
+
+        if ( // check if we request to crypt a text
+            (isset($options['crypt']) && !empty($options['crypt']) && $crypt = $options['crypt'] ) ||
+            (isset($options['c'])     && !empty($options['c'])     && $crypt = $options['c'])
+        ) {
+            $action                  = "crypt";
+            $actionOptions['text']   = $crypt;
+            $actionOptions['inline'] = array_key_exists('inline', $options) || array_key_exists('i', $options);
+        } else if ( // check if we request to decrypt a vault string
+            (isset($options['decrypt']) && !empty($options['decrypt']) && $decrypt = $options['decrypt'] ) ||
+            (isset($options['d'])       && !empty($options['d'])       && $decrypt = $options['d'])
+        ) {
+            $action                 = "decrypt";
+            $actionOptions['vault'] = $decrypt;
+        }
+
+
+        switch($action) {
+            case "config":
+                $this->doReplace();
+                break;
+            case "crypt":
+                $token = $this->vault->crypt($actionOptions['text'], $this->getVaultPassword());
+                if ($actionOptions['inline']) {
+                    $tokens = explode("\n", $token);
+                    $token  = null;
+                    foreach ($tokens as $tokenLine) {
+                        $token .= trim($tokenLine) . '\n';
+                    }
+                }
+                echo rtrim($token, '\n') . PHP_EOL;
+                break;
+            case "decrypt":
+                $text = $this->vault->decrypt($actionOptions['vault'], $this->getVaultPassword());
+                printf("Decrypted: %s\n", $text);
+                break;
+        }
+    }
+
+    public function help()
+    {
+        printf("Uitlisation: %s [CONFIGURATION.INI]...\n", basename($this->args[0]));
+        printf("Generate your configuration :\n");
+        printf("  -p   --password the password to use for generate the config files\n");
+        printf("\n");
+        printf("Vault password: \n");
+        printf("  -c,  --crypt    crypt a string.\n");
+        printf("  -i,  --inline   return the crypted string with the inline format (mandatory for .ini files).\n");
+        printf("\n");
+        printf("  -d,  --decrypt  decrypt a vault string.\n");
+
+    }
+
+    /**
+     * Retrieve all tokens
+     * Retrieve all dist files
+     * Make replacement in dist file
+     * Write the new config file in configs
+     * @throws \Exception
+     */
+    protected function doReplace()
+    {
+        $tokens = $this->getTokens();
+
+        foreach ($this->getDistfiles() as $file) {
+            $content = file_get_contents($file);
+            $file    = str_replace('\\', '/', $file);
+
+            if (preg_match(
+                '/\/dists\/(.*?).dist/',
+                $file,
+                $match
+            ) && count($match)) {
+                $sectionName  = str_replace('/', '_', strtoupper(substr($match[1], 0, strpos($match[1], "."))));
+                $customTokens = $tokens[self::DEFAULT_SECTION];
+                if (array_key_exists($sectionName, $tokens)) {
+                    $customTokens = $tokens[$sectionName];
+                }
+            }
+
+            foreach ($customTokens as $key => $value) {
+                $content = str_replace($key, $value, $content);
+            }
+
+            $configFile = str_replace(
+                    array(
+                        self::DATA_DISTS_DIR,
+                        self::DIST_EXT,
+                    ), array(
+                        self::DEST_DIR,
+                        NULL,
+                    ), $file);
+            printf("Writing : %s\n", $configFile);
+            file_put_contents($configFile, $content);
+        }
+    }
+
+    /**
+     * Return all dist file
+     * @return type
+     */
+    protected function getDistfiles()
+    {
+        $distFiles = array();
+        $expr      = sprintf("/%s$/", self::DIST_EXT);
+
+        return $this->getFiles(realpath(dirname(__FILE__) . "/../" . self::DATA_DISTS_DIR), $expr);
+    }
+
+    /**
+     * Return an array of file for a given directory and regex
+     * @param string $directory
+     * @param string $expr
+     * @return array
+     */
+    protected function getFiles($directory, $expr)
+    {
+        $files    = array();
+        $iterator = new RecursiveDirectoryIterator(
+                $directory, RecursiveDirectoryIterator::SKIP_DOTS
+        );
+
+        foreach ($iterator as $file) {
+            if (preg_match($expr, $file->getPathName()) && is_file($file->getPathName())) {
+                $files[] = $file->getPathName();
+            } else if (is_dir($file->getPathName())) {
+                $files = array_merge(
+                        $files, $this->getFiles($file->getPathName(), $expr)
+                );
+            }
+        }
+
+        return $files;
+    }
+
+    /**
+     * Return all tokens by section
+     * @return array
+     */
+    protected function getTokens()
+    {
+        if (!$this->tokens) {
+            foreach ($this->getInitFile() as $iniFile) {
+                $rawTokens = $this->prepareTokens(
+                    parse_ini_file($iniFile, TRUE, INI_SCANNER_RAW)
+                );
+
+                if (!array_key_exists(self::DEFAULT_SECTION, $rawTokens)) {
+                    throw new \Exception('No "DEFAULT" configuration found in your ini file');
+                }
+
+                $this->tokens = $this->mergeTokens($this->tokens, $this->getBisectedTokens($rawTokens));
+            }
+        }
+
+        return $this->tokens;
+    }
+
+    protected function mergeTokens($previousTokens, $tokens)
+    {
+        $newTokens = array();
+        $keys = array_unique(array_merge(array_keys($previousTokens), array_keys($tokens)));
+        foreach ($keys as $key) {
+            $exitsOnPrevious = array_key_exists($key, $previousTokens);
+            $exitsOnNew      = array_key_exists($key, $tokens);
+            if ($exitsOnNew && $exitsOnPrevious) {
+                $newTokens[$key] = array_merge($previousTokens[$key], $tokens[$key]);
+            } else if ($exitsOnNew) {
+                $newTokens[$key] = $tokens[$key];
+            } else {
+                $newTokens[$key] = $previousTokens[$key];
+            }
+        }
+
+        return $newTokens;
+    }
+
+    /**
+     * bisect sections if need
+     * @param array $rawTokens
+     * @return array
+     */
+    protected function getBisectedTokens($rawTokens)
+    {
+        $tokens                                           = array();
+        $tokens[self::DEFAULT_SECTION]                    = $rawTokens[self::DEFAULT_SECTION];
+        $rawTokens[self::DEFAULT_SECTION]['__HOSTNAME__'] = gethostname();
+
+        foreach ($rawTokens as $section => $values) {
+            $sections = explode(self::SECTION_SEPARATOR, $section);
+            foreach ($sections as $sectionName) {
+                $tokens[$sectionName] = array_merge($rawTokens[self::DEFAULT_SECTION], $values);
+            }
+        }
+
+        return $tokens;
+    }
+
+    protected function getInitFile()
+    {
+        $args = $this->args;
+        array_shift($args);
+
+        foreach ($args as $arg) {
+            $file = $this->findIniFile($arg);
+            if ($file) {
+                $this->iniFiles[] = $file;
+            } else {
+                printf("Can't locate your ini file \"%s\"\n", $arg);
+                exit -1;
+            }
+        }
+
+        return $this->iniFiles;
+    }
+
+    protected function findIniFile($filename)
+    {
+        if (is_file($filename)) {
+            return $filename;
+        } else {
+            if (!preg_match('/.ini$/', $filename)) {
+                $filename = sprintf('%s.ini', $filename);
+            }
+
+            $expr = sprintf('/%s%s$/i', preg_quote(DIRECTORY_SEPARATOR, DIRECTORY_SEPARATOR), $filename);
+            $iterator = new RecursiveIteratorIterator(
+                    new RecursiveDirectoryIterator(
+                        realpath(
+                            sprintf('%s%s..%s%s', __DIR__, DIRECTORY_SEPARATOR, DIRECTORY_SEPARATOR, self::APP_INI_DIR)
+                        ),
+                        RecursiveIteratorIterator::SELF_FIRST & RecursiveDirectoryIterator::SKIP_DOTS
+            ));
+
+            foreach ($iterator as $file) {
+                if (preg_match($expr, $file->getPathName()) && is_file($file->getPathName())) {
+                    return $file->getPathName();
+                }
+            }
+        }
+
+        return false;
+    }
+
+
+
+    protected function prepareTokens($tokens)
+    {
+        $response = $this->iterateTokens($tokens);
+
+        return $response;
+    }
+
+    /**
+     * Iterate all token's array and transform if need
+     * @param array $tokens
+     * @return array
+     */
+    protected function iterateTokens($tokens)
+    {
+        $response = array();
+
+        foreach ($tokens as $key => $value) {
+            if (is_scalar($value)) {
+                $value = $this->transformToken($key, $value);
+            } else if (is_array($value)) {
+                $value = $this->iterateTokens($value);
+            }
+            $response[$key] = $value;
+        }
+
+        return $response;
+    }
+
+    /**
+     * Transform PHP code in value
+     * @param string $key
+     * @param array $value
+     * @return array
+     */
+    protected function transformToken($key, $value)
+    {
+        if (preg_match('/^PHP:/', $value)) {
+            $value = str_replace('PHP:', '', $value);
+            eval(sprintf('$value = %s;', $value));
+        } else if (preg_match('/^!vault/i', $value)) {
+            try {
+                $value = $this->vault->decrypt($value, $this->getVaultPassword());
+            } catch (\Exception $e) {
+                printf("Error: %s\n", $e->getMessage());
+                exit -1;
+            }
+        }
+
+        // transform Unix separator to Windows separator
+        if ($this->windowsHost && preg_match('/^@.*@$/', $key)) {
+            $value = str_replace('\\', '/', $value);
+        }
+
+        return $value;
+    }
+
+    /**
+     * Get vault password
+     *
+     * @return string
+     */
+    protected function getVaultPassword()
+    {
+        if (!$this->vaultPassword) {
+            if (
+                ($vaultFile = sprintf("%s/.vault_password", getenv("HOME")))
+                &&
+                file_exists($vaultFile)
+            ) {
+                printf("vault password loaded from ~/.vault_password\n");
+                $this->vaultPassword = file_get_contents($vaultFile);
+            } else {
+                printf("File \"~/.vault_password\" was not found.\n");
+                system('stty -echo');
+                printf("Enter the vault password: ");
+                $this->vaultPassword = trim(fgets(STDIN));
+                system('stty echo');
+            }
+            $this->vaultPassword = trim(str_replace("\n\r", "", $this->vaultPassword));
+        }
+
+        return $this->vaultPassword;
+    }
+}
+
+$config = new ConfigureApplication($argv, $argc);
